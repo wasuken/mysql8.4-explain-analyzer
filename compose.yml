@@ -1,0 +1,49 @@
+services:
+  mysql:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mysql_explain_analyze
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: explain_test
+      MYSQL_USER: testuser
+      MYSQL_PASSWORD: testpass
+    ports:
+      - "3366:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./sql/init:/docker-entrypoint-initdb.d
+      - ./sql/data:/sql/data
+    command: >
+      --innodb_buffer_pool_size=1G
+      --max_connections=200
+      --innodb_redo_log_capacity=256M
+      --slow_query_log=1
+      --slow_query_log_file=/var/log/mysql/slow.log
+      --long_query_time=0.1
+      --log_queries_not_using_indexes=1
+    networks:
+      - mysql_network
+
+  # MySQL管理用のphpMyAdmin（オプション）
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin:latest
+    container_name: phpmyadmin
+    environment:
+      PMA_HOST: mysql
+      PMA_USER: testuser
+      PMA_PASSWORD: testpass
+    ports:
+      - "8088:80"
+    depends_on:
+      - mysql
+    networks:
+      - mysql_network
+
+volumes:
+  mysql_data:
+
+networks:
+  mysql_network:
+    driver: bridge
