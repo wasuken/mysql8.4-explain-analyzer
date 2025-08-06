@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 """
-EXPLAIN ANALYZE 実践検証スクリプト（改良版）
-劇的な差が出るクエリパターンでインデックス設計を検証
+EXPLAIN ANALYZE統合ベンチマーク - 完全修正版
+sql/data/ 直下実行版、関数定義順序修正済み
 """
-
 import mysql.connector
 import time
-import re
-from datetime import datetime
-import json
-import pandas as pd
+import os
 
 DB_CONFIG = {
     'host': 'localhost',
@@ -20,384 +16,315 @@ DB_CONFIG = {
     'charset': 'utf8mb4'
 }
 
-class ImprovedBenchmark:
-    def __init__(self):
-        self.conn = mysql.connector.connect(**DB_CONFIG)
-        self.results = []
-        
-    def __del__(self):
-        if hasattr(self, 'conn'):
-            self.conn.close()
+# SQLクエリ定義（範囲系特化 + 新パターン）
+QUERIES = {
+    "date_range_massive": {
+        "name": "💀 大量日付範囲スキャン",
+        "sql": """
+        SELECT order_id, order_date, total_amount, shipping_country
+        FROM orders
+        WHERE order_date >= DATE_SUB(CURDATE(), INTERVAL 12 MONTH)
+        ORDER BY order_date DESC
+        LIMIT 10000
+        """
+    },
+    "amount_range_heavy": {
+        "name": "👻 金額範囲の重いスキャン",
+        "sql": """
+        SELECT *
+        FROM orders
+        WHERE total_amount BETWEEN 500 AND 1000
+        ORDER BY total_amount DESC
+        LIMIT 5000
+        """
+    },
+    "country_filter_massive": {
+        "name": "📅 国別フィルタ大量検索",
+        "sql": """
+        SELECT *
+        FROM orders
+        WHERE shipping_country = 'Japan'
+        ORDER BY order_date DESC
+        LIMIT 8000
+        """
+    },
+    "double_range_nightmare": {
+        "name": "🔥 ダブル範囲検索地獄",
+        "sql": """
+        SELECT order_id, order_date, total_amount, shipping_country
+        FROM orders
+        WHERE order_date BETWEEN DATE_SUB(CURDATE(), INTERVAL 6 MONTH) AND CURDATE()
+          AND total_amount BETWEEN 200 AND 800
+        ORDER BY total_amount DESC, order_date DESC
+        LIMIT 3000
+        """
+    },
+    "status_range_combo": {
+        "name": "⚡ ステータス + 範囲コンボ",
+        "sql": """
+        SELECT *
+        FROM orders
+        WHERE status IN ('delivered', 'shipped')
+          AND total_amount > 300
+        ORDER BY total_amount DESC
+        LIMIT 6000
+        """
+    },
+    "complex_range_aggregation": {
+        "name": "📊 複雑範囲集計",
+        "sql": """
+        SELECT 
+            shipping_country,
+            DATE_FORMAT(order_date, '%Y-%m') as month,
+            COUNT(*) as order_count,
+            AVG(total_amount) as avg_amount
+        FROM orders
+        WHERE order_date >= DATE_SUB(CURDATE(), INTERVAL 18 MONTH)
+          AND total_amount > 200
+        GROUP BY shipping_country, DATE_FORMAT(order_date, '%Y-%m')
+        ORDER BY order_count DESC
+        LIMIT 100
+        """
+    },
+    "no_index_functions": {
+        "name": "💩 関数でインデックス無効化",
+        "sql": """
+        SELECT *
+        FROM orders
+        WHERE YEAR(order_date) = 2024
+          AND MONTH(order_date) >= 10
+          AND total_amount * 1.1 > 500
+        ORDER BY order_id DESC
+        LIMIT 2000
+        """
+    }
+}
+
+def show_current_indexes(cursor):
+    """現在のインデックス状況を表示"""
+    print("🔍 現在のインデックス状況:")
+    cursor.execute("""
+        SELECT TABLE_NAME, INDEX_NAME, COLUMN_NAME, NON_UNIQUE
+        FROM information_schema.STATISTICS 
+        WHERE TABLE_SCHEMA = 'explain_test'
+          AND TABLE_NAME IN ('orders', 'customers')
+          AND INDEX_NAME != 'PRIMARY'
+        ORDER BY TABLE_NAME, INDEX_NAME
+    """)
+    indexes = cursor.fetchall()
     
-    def extract_execution_time(self, explain_output):
-        """EXPLAIN ANALYZEの出力から実行時間を抽出"""
-        if not explain_output:
-            return None
-            
-        pattern = r'actual time=[\d.]+\.\.(\d+\.?\d*)'
-        matches = re.findall(pattern, explain_output)
-        
-        if matches:
-            return float(matches[-1])
-        return None
+    if indexes:
+        for table, index_name, column, non_unique in indexes:
+            print(f"   📋 {table}.{index_name} ({column})")
+    else:
+        print("   ✅ PRIMARY KEY以外のインデックスなし")
+
+def drop_all_indexes(cursor):
+    """インデックス強制削除"""
+    print("🗑️ インデックス完全削除開始...")
     
-    def extract_rows_examined(self, explain_output):
-        """検査された行数を抽出"""
-        if not explain_output:
-            return None
-            
-        pattern = r'rows=(\d+)'
-        matches = re.findall(pattern, explain_output)
-        
-        if matches:
-            return int(matches[0])
-        return None
+    cursor.execute("""
+        SELECT DISTINCT TABLE_NAME, INDEX_NAME
+        FROM information_schema.STATISTICS 
+        WHERE TABLE_SCHEMA = 'explain_test'
+          AND TABLE_NAME IN ('orders', 'customers')
+          AND INDEX_NAME != 'PRIMARY'
+          AND INDEX_NAME NOT LIKE 'FK_%'
+    """)
     
-    def run_explain_analyze(self, query, description=""):
-        """EXPLAIN ANALYZEを実行"""
-        cursor = self.conn.cursor()
-        
+    existing_indexes = cursor.fetchall()
+    
+    for table_name, index_name in existing_indexes:
         try:
-            explain_query = f"EXPLAIN ANALYZE {query}"
-            start_time = time.time()
-            cursor.execute(explain_query)
-            result = cursor.fetchall()
-            end_time = time.time()
-            
-            explain_output = ""
-            if result:
-                explain_output = "\n".join([str(row[0]) for row in result])
-            
-            execution_time = self.extract_execution_time(explain_output)
-            rows_examined = self.extract_rows_examined(explain_output)
-            
-            return {
-                'description': description,
-                'query': query.strip(),
-                'execution_time_ms': execution_time,
-                'rows_examined': rows_examined,
-                'explain_output': explain_output,
-                'total_time_sec': end_time - start_time,
-                'timestamp': datetime.now().isoformat()
-            }
-            
+            drop_sql = f"DROP INDEX {index_name} ON {table_name}"
+            cursor.execute(drop_sql)
+            print(f"    🗑️ 削除成功: {table_name}.{index_name}")
         except Exception as e:
-            return {
-                'description': description,
-                'query': query.strip(),
-                'execution_time_ms': None,
-                'rows_examined': None,
-                'explain_output': f"ERROR: {str(e)}",
-                'total_time_sec': None,
-                'timestamp': datetime.now().isoformat()
-            }
-        finally:
-            cursor.close()
+            print(f"    ❌ 削除失敗: {table_name}.{index_name} - {e}")
+
+def create_optimal_indexes(cursor):
+    """範囲系に特化したインデックス"""
+    print("⚡ 範囲系特化インデックス作成開始...")
     
-    def create_index(self, index_name, table, columns, description=""):
-        """インデックスを作成"""
-        cursor = self.conn.cursor()
+    indexes = [
+        ("orders", "idx_shipping_country", "shipping_country"),
+        ("orders", "idx_order_date", "order_date"), 
+        ("orders", "idx_total_amount", "total_amount"),
+        ("orders", "idx_status", "status"),
+        
+        # 複合インデックス（範囲 + ソート最適化）
+        ("orders", "idx_date_amount", "order_date, total_amount"),
+        ("orders", "idx_amount_date", "total_amount, order_date"),
+        ("orders", "idx_country_date", "shipping_country, order_date"),
+        ("orders", "idx_status_amount", "status, total_amount"),
+        
+        # カバリングインデックス（範囲検索用）
+        ("orders", "idx_covering_range", "order_date, total_amount, shipping_country, status")
+    ]
+    
+    for table, index_name, columns in indexes:
         try:
-            query = f"CREATE INDEX {index_name} ON {table}({columns})"
-            print(f"🔧 インデックス作成: {description}")
-            print(f"   SQL: {query}")
-            start_time = time.time()
-            cursor.execute(query)
-            self.conn.commit()
-            end_time = time.time()
-            print(f"   ✅ 作成完了 ({end_time - start_time:.2f}秒)")
+            create_sql = f"CREATE INDEX {index_name} ON {table}({columns})"
+            cursor.execute(create_sql)
+            print(f"    ✅ 作成成功: {table}.{index_name} ({columns})")
         except Exception as e:
-            print(f"   ❌ エラー: {e}")
-        finally:
-            cursor.close()
-    
-    def drop_all_indexes(self):
-        """全インデックスを削除"""
-        cursor = self.conn.cursor()
-        indexes_to_drop = [
-            ('orders', 'idx_date_country'),
-            ('orders', 'idx_country_date'),
-            ('orders', 'idx_status_date'),
-            ('orders', 'idx_amount_date'),
-            ('orders', 'idx_covering'),
-            ('orders', 'idx_optimal'),
-            ('customers', 'idx_customer_country'),
-            ('customers', 'idx_customer_reg_country')
-        ]
+            print(f"    ⚠️ 作成失敗: {table}.{index_name} - {e}")
+
+def run_explain_analyze(cursor, sql):
+    """EXPLAIN ANALYZEで実行して詳細情報取得"""
+    try:
+        explain_sql = f"EXPLAIN ANALYZE {sql}"
+        cursor.execute(explain_sql)
+        result = cursor.fetchall()
         
-        for table, index_name in indexes_to_drop:
-            try:
-                cursor.execute(f"DROP INDEX {index_name} ON {table}")
-                self.conn.commit()
-            except:
-                pass
-        cursor.close()
-        print("🧹 全インデックス削除完了")
-    
-    def get_heavy_queries(self):
-        """重いクエリパターンを定義"""
-        return [
-            {
-                'name': 'hell_join_aggregation',
-                'query': """
-                SELECT c.country, c.city, 
-                       COUNT(*) as order_count,
-                       SUM(o.total_amount) as total_revenue,
-                       AVG(o.total_amount) as avg_order_value,
-                       MAX(o.total_amount) as max_order
-                FROM customers c 
-                JOIN orders o ON c.customer_id = o.customer_id
-                WHERE o.order_date BETWEEN '2023-06-01' AND '2023-06-30'
-                  AND o.total_amount > 500
-                  AND c.registration_date < '2023-01-01'
-                GROUP BY c.country, c.city
-                HAVING COUNT(*) > 5
-                ORDER BY total_revenue DESC
-                LIMIT 50
-                """,
-                'description': '💀 地獄の結合集計クエリ'
-            },
-            {
-                'name': 'subquery_nightmare',
-                'query': """
-                SELECT DISTINCT c.email, c.country,
-                       (SELECT COUNT(*) FROM orders o2 
-                        WHERE o2.customer_id = c.customer_id 
-                          AND o2.status = 'delivered') as delivered_count,
-                       (SELECT MAX(total_amount) FROM orders o3 
-                        WHERE o3.customer_id = c.customer_id) as max_amount
-                FROM customers c
-                WHERE EXISTS (
-                    SELECT 1 FROM orders o4 
-                    WHERE o4.customer_id = c.customer_id 
-                      AND o4.order_date >= '2023-01-01'
-                      AND o4.total_amount > 800
-                )
-                ORDER BY max_amount DESC
-                LIMIT 100
-                """,
-                'description': '👻 サブクエリ地獄'
-            },
-            {
-                'name': 'complex_date_range',
-                'query': """
-                SELECT DATE_FORMAT(o.order_date, '%Y-%m') as month,
-                       o.shipping_country,
-                       o.status,
-                       COUNT(*) as order_count,
-                       SUM(o.total_amount) as revenue,
-                       COUNT(DISTINCT o.customer_id) as unique_customers
-                FROM orders o
-                WHERE o.order_date BETWEEN '2023-01-01' AND '2023-12-31'
-                  AND o.total_amount BETWEEN 100 AND 2000
-                  AND o.status IN ('delivered', 'shipped')
-                GROUP BY DATE_FORMAT(o.order_date, '%Y-%m'), o.shipping_country, o.status
-                ORDER BY month, revenue DESC
-                """,
-                'description': '📅 複雑な日付範囲集計'
-            },
-            {
-                'name': 'ranking_with_window',
-                'query': """
-                SELECT c.country,
-                       c.email,
-                       o.total_amount,
-                       o.order_date,
-                       ROW_NUMBER() OVER (PARTITION BY c.country ORDER BY o.total_amount DESC) as rank_in_country
-                FROM customers c
-                JOIN orders o ON c.customer_id = o.customer_id
-                WHERE o.order_date >= '2023-01-01'
-                  AND o.status = 'delivered'
-                HAVING rank_in_country <= 10
-                ORDER BY c.country, rank_in_country
-                """,
-                'description': '🏆 ウィンドウ関数ランキング'
-            }
-        ]
-    
-    def get_index_strategies(self):
-        """インデックス戦略パターンを定義"""
-        return [
-            {
-                'name': 'no_index',
-                'description': '❌ インデックスなし',
-                'setup': lambda: None,
-                'cleanup': lambda: None
-            },
-            {
-                'name': 'single_indexes',
-                'description': '🔸 単一カラムインデックス',
-                'setup': lambda: [
-                    self.create_index('idx_order_date', 'orders', 'order_date', '注文日'),
-                    self.create_index('idx_country', 'orders', 'shipping_country', '配送国'),
-                    self.create_index('idx_status', 'orders', 'status', 'ステータス')
-                ],
-                'cleanup': lambda: self.drop_all_indexes()
-            },
-            {
-                'name': 'bad_composite',
-                'description': '💩 悪い複合インデックス（逆順）',
-                'setup': lambda: self.create_index('idx_bad_order', 'orders', 'shipping_country, status, order_date', '悪い順序'),
-                'cleanup': lambda: self.drop_all_indexes()
-            },
-            {
-                'name': 'good_composite',
-                'description': '✨ 良い複合インデックス',
-                'setup': lambda: [
-                    self.create_index('idx_optimal_1', 'orders', 'order_date, total_amount, status', '日付→金額→ステータス'),
-                    self.create_index('idx_customer_reg', 'customers', 'registration_date, country', '登録日→国')
-                ],
-                'cleanup': lambda: self.drop_all_indexes()
-            },
-            {
-                'name': 'covering_index',
-                'description': '🚀 カバリングインデックス',
-                'setup': lambda: [
-                    self.create_index('idx_covering', 'orders', 'order_date, shipping_country, status, total_amount, customer_id', 'カバリング'),
-                    self.create_index('idx_customer_all', 'customers', 'customer_id, country, city, email, registration_date', '顧客カバリング')
-                ],
-                'cleanup': lambda: self.drop_all_indexes()
-            }
-        ]
-    
-    def run_benchmark_suite(self):
-        """改良版ベンチマーク実行"""
-        print("🔥 EXPLAIN ANALYZE 実践検証開始")
-        print("=" * 80)
+        explain_output = "\n".join([str(row[0]) for row in result])
         
-        queries = self.get_heavy_queries()
-        strategies = self.get_index_strategies()
+        # actual timeとrowsを抽出
+        import re
+        actual_times = re.findall(r'actual time=[\d.]+\.\.([\d.]+)', explain_output)
+        rows_examined = re.findall(r'rows=(\d+)', explain_output)
         
-        for strategy in strategies:
-            print(f"\n{strategy['description']}")
-            print("-" * 70)
-            
-            # インデックス設定
-            if strategy['setup']:
-                setup_result = strategy['setup']()
-                if isinstance(setup_result, list):
-                    pass  # 複数インデックス作成済み
-            
-            # 各クエリを実行
-            for query in queries:
-                print(f"\n{query['description']}:")
-                result = self.run_explain_analyze(query['query'], 
-                                                f"{strategy['name']}_{query['name']}")
-                
-                result['strategy_name'] = strategy['name']
-                result['strategy_description'] = strategy['description']
-                result['query_name'] = query['name']
-                result['query_description'] = query['description']
-                
-                self.results.append(result)
-                
-                if result['execution_time_ms']:
-                    print(f"  ⏱️  実行時間: {result['execution_time_ms']:.1f}ms")
-                    print(f"  📊 検査行数: {result['rows_examined']:,}行" if result['rows_examined'] else "  📊 検査行数: N/A")
-                    if result['total_time_sec']:
-                        print(f"  🕐 総実行時間: {result['total_time_sec']:.2f}秒")
-                else:
-                    print(f"  ❌ エラー: 実行失敗")
-            
-            # インデックス削除
-            if strategy['cleanup']:
-                strategy['cleanup']()
-    
-    def generate_impact_report(self):
-        """インパクトの強いレポートを生成"""
-        if not self.results:
-            print("❌ ベンチマーク結果がありません")
-            return
+        actual_time = float(actual_times[-1]) if actual_times else 0
+        total_rows = int(rows_examined[0]) if rows_examined else 0
         
-        print("\n" + "🎯" * 30)
-        print("💥 劇的改善効果レポート")
-        print("🎯" * 30)
+        return {
+            'actual_time_ms': actual_time,
+            'rows_examined': total_rows,
+            'explain_output': explain_output
+        }
         
-        df = pd.DataFrame(self.results)
+    except Exception as e:
+        return {
+            'actual_time_ms': None,
+            'rows_examined': None,
+            'explain_output': f"ERROR: {str(e)}"
+        }
+
+def run_query_with_timer(cursor, sql):
+    """通常実行 + EXPLAIN ANALYZE実行"""
+    try:
+        # 通常実行
+        start = time.time()
+        cursor.execute(sql)
+        result = cursor.fetchall()
+        end = time.time()
+        execution_time = end - start
         
-        for query_name in df['query_name'].unique():
-            query_results = df[df['query_name'] == query_name].copy()
-            query_results = query_results.dropna(subset=['execution_time_ms'])
-            query_results = query_results.sort_values('execution_time_ms')
-            
-            if len(query_results) == 0:
-                continue
-                
-            print(f"\n🔥 {query_results.iloc[0]['query_description']}")
-            print("-" * 60)
-            
-            baseline_time = None
-            fastest_time = None
-            
-            # ベースライン取得
-            baseline_row = query_results[query_results['strategy_name'] == 'no_index']
-            if not baseline_row.empty:
-                baseline_time = baseline_row.iloc[0]['execution_time_ms']
-            
-            fastest_time = query_results.iloc[0]['execution_time_ms']
-            
-            for _, row in query_results.iterrows():
-                time_ms = row['execution_time_ms']
-                improvement = ""
-                emoji = ""
-                
-                if baseline_time and baseline_time > 0:
-                    if row['strategy_name'] == 'no_index':
-                        improvement = " (ベースライン)"
-                        emoji = "😱"
-                    else:
-                        ratio = baseline_time / time_ms
-                        if ratio > 10:
-                            improvement = f" ({ratio:.0f}倍高速化!!!)"
-                            emoji = "🚀"
-                        elif ratio > 5:
-                            improvement = f" ({ratio:.1f}倍高速化!!)"
-                            emoji = "⚡"
-                        elif ratio > 2:
-                            improvement = f" ({ratio:.1f}倍高速化!)"
-                            emoji = "✨"
-                        elif ratio > 1.1:
-                            improvement = f" ({ratio:.1f}倍高速化)"
-                            emoji = "📈"
-                        else:
-                            improvement = f" ({time_ms/baseline_time:.1f}倍低速化)"
-                            emoji = "💩"
-                
-                print(f"{emoji} {row['strategy_description']:40} {time_ms:8.1f}ms{improvement}")
+        # EXPLAIN ANALYZE実行
+        explain_result = run_explain_analyze(cursor, sql)
         
-        # JSONで詳細保存
-        with open('impact_results.json', 'w', encoding='utf-8') as f:
-            json.dump(self.results, f, ensure_ascii=False, indent=2)
+        return {
+            'execution_time': execution_time,
+            'result_rows': len(result),
+            'actual_time_ms': explain_result['actual_time_ms'],
+            'rows_examined': explain_result['rows_examined'],
+            'explain_output': explain_result['explain_output']
+        }
         
-        print(f"\n📁 詳細結果をimpact_results.jsonに保存")
-        print(f"📊 総計 {len(self.results)} 件のテストを実行")
+    except Exception as e:
+        return {
+            'execution_time': None,
+            'result_rows': 0,
+            'actual_time_ms': None,
+            'rows_examined': None,
+            'explain_output': f"ERROR: {str(e)}"
+        }
 
 def main():
-    """メイン処理"""
-    benchmark = ImprovedBenchmark()
+    print("🔥 EXPLAIN ANALYZE統合ベンチマーク (sql/data/ 版)")
+    print("=" * 60)
     
     try:
-        # 全インデックス削除してクリーンスタート
-        benchmark.drop_all_indexes()
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor()
         
-        # ベンチマーク実行
-        benchmark.run_benchmark_suite()
+        for query_key, query_info in QUERIES.items():
+            name = query_info["name"]
+            sql = query_info["sql"]
+            
+            print(f"\n{name}:")
+            print("-" * 40)
+            
+            # インデックス削除前の状況確認
+            show_current_indexes(cursor)
+            
+            # インデックスなしで実行
+            drop_all_indexes(cursor)
+            conn.commit()
+            
+            print("\n❌ インデックス削除後:")
+            show_current_indexes(cursor)
+            
+            result1 = run_query_with_timer(cursor, sql)
+            if not result1['execution_time']:
+                continue
+                
+            print(f"❌ インデックスなし:")
+            print(f"   実行時間: {result1['execution_time']:.3f}秒")
+            print(f"   結果行数: {result1['result_rows']}行")
+            if result1['actual_time_ms']:
+                print(f"   actual time: {result1['actual_time_ms']:.1f}ms")
+            if result1['rows_examined']:
+                print(f"   検査行数: {result1['rows_examined']:,}行")
+            
+            # インデックスありで実行
+            create_optimal_indexes(cursor)
+            conn.commit()
+            
+            print("\n✅ インデックス作成後:")
+            show_current_indexes(cursor)
+            
+            result2 = run_query_with_timer(cursor, sql)
+            if not result2['execution_time']:
+                continue
+                
+            print(f"✅ インデックスあり:")
+            print(f"   実行時間: {result2['execution_time']:.3f}秒")
+            print(f"   結果行数: {result2['result_rows']}行")
+            if result2['actual_time_ms']:
+                print(f"   actual time: {result2['actual_time_ms']:.1f}ms")
+            if result2['rows_examined']:
+                print(f"   検査行数: {result2['rows_examined']:,}行")
+            
+            # 改善効果計算
+            if result1['execution_time'] and result2['execution_time'] and result2['execution_time'] > 0:
+                time_improvement = result1['execution_time'] / result2['execution_time']
+                print(f"🚀 実行時間改善: {time_improvement:.1f}倍高速化")
+            
+            if result1['actual_time_ms'] and result2['actual_time_ms'] and result2['actual_time_ms'] > 0:
+                actual_improvement = result1['actual_time_ms'] / result2['actual_time_ms']
+                print(f"⚡ actual time改善: {actual_improvement:.1f}倍高速化")
+            
+            if result1['rows_examined'] and result2['rows_examined']:
+                rows_improvement = result1['rows_examined'] / result2['rows_examined'] if result2['rows_examined'] > 0 else 1
+                print(f"📊 検査行数削減: {rows_improvement:.1f}倍減少")
+            
+            # EXPLAIN出力（簡略版）
+            if result1['explain_output'] and "ERROR" not in result1['explain_output']:
+                print(f"\n🔍 EXPLAIN詳細 (インデックスなし):")
+                lines = result1['explain_output'].split('\n')[:2]
+                for line in lines:
+                    print(f"   {line}")
+            
+            if result2['explain_output'] and "ERROR" not in result2['explain_output']:
+                print(f"\n🔍 EXPLAIN詳細 (インデックスあり):")
+                lines = result2['explain_output'].split('\n')[:2]
+                for line in lines:
+                    print(f"   {line}")
         
-        # インパクトレポート生成
-        benchmark.generate_impact_report()
-        
-    except KeyboardInterrupt:
-        print("\n⏹️  ベンチマーク中断されました")
+    except mysql.connector.Error as e:
+        print(f"💥 データベースエラー: {e}")
     except Exception as e:
-        print(f"💥 エラーが発生しました: {e}")
+        print(f"💥 予期しないエラー: {e}")
         import traceback
         traceback.print_exc()
     finally:
-        # クリーンアップ
         try:
-            benchmark.drop_all_indexes()
+            conn.close()
         except:
             pass
+    
+    print(f"\n🎉 EXPLAIN ANALYZEベンチマーク完了")
 
 if __name__ == "__main__":
     main()

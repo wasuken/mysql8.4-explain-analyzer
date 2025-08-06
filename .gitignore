@@ -1,2 +1,2 @@
-sql/data/*.txt
 sql/data/*.json
+*.txt

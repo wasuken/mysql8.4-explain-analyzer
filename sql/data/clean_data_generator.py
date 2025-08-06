@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-現実的な偏りを持つサンプルデータ生成スクリプト
-インデックス効果を最大化するための戦略的データ分布
+完全クリーンスタート版サンプルデータ生成スクリプト
+既存インデックスを全削除してから現実的なデータを生成
 """
 
 import mysql.connector
@@ -12,7 +12,7 @@ import sys
 import uuid
 
 # 現実的な偏りを持つデータ分布
-FIRST_NAMES = ['Taro', 'Hanako', 'Yuki', 'Akiko', 'Hiroshi'] * 20 + ['John', 'Mary', 'David'] * 5  # 日本人が多い
+FIRST_NAMES = ['Taro', 'Hanako', 'Yuki', 'Akiko', 'Hiroshi'] * 20 + ['John', 'Mary', 'David'] * 5
 LAST_NAMES = ['Tanaka', 'Suzuki', 'Sato', 'Takahashi'] * 25 + ['Smith', 'Johnson'] * 10
 CITIES_JAPAN = ['Tokyo', 'Osaka', 'Yokohama', 'Nagoya', 'Kyoto', 'Fukuoka']
 CITIES_OTHER = ['New York', 'Los Angeles', 'London', 'Berlin', 'Paris']
@@ -55,17 +55,76 @@ def connect_db():
         print(f"💥 データベース接続エラー: {e}")
         sys.exit(1)
 
-def get_season(date):
-    """日付から季節を判定"""
-    month = date.month
-    if month in [12, 1, 2]:
-        return 'winter'
-    elif month in [3, 4, 5]:
-        return 'spring'
-    elif month in [6, 7, 8]:
-        return 'summer'
-    else:
-        return 'autumn'
+def drop_all_existing_indexes(conn):
+    """既存の全インデックスを削除（PRIMARY KEY以外）"""
+    print("🧹 既存インデックスの完全削除開始...")
+    cursor = conn.cursor()
+    
+    # 全テーブルの全インデックス情報を取得
+    tables = ['customers', 'products', 'orders', 'access_logs']
+    
+    for table in tables:
+        try:
+            # テーブルのインデックス一覧取得
+            cursor.execute(f"SHOW INDEX FROM {table}")
+            indexes = cursor.fetchall()
+            
+            dropped_indexes = []
+            for index in indexes:
+                key_name = index[2]  # Key_name
+                # PRIMARY KEYと外部キーは削除しない
+                if key_name != 'PRIMARY' and not key_name.startswith('FK_'):
+                    try:
+                        cursor.execute(f"DROP INDEX {key_name} ON {table}")
+                        dropped_indexes.append(key_name)
+                    except mysql.connector.Error as e:
+                        if 'check that column/key exists' not in str(e):
+                            print(f"  ⚠️  {table}.{key_name} 削除エラー: {e}")
+            
+            if dropped_indexes:
+                print(f"  ✅ {table}: {', '.join(dropped_indexes)} を削除")
+            else:
+                print(f"  ✨ {table}: 削除対象インデックスなし")
+                
+        except mysql.connector.Error as e:
+            print(f"  ⚠️  テーブル {table} の処理でエラー: {e}")
+    
+    conn.commit()
+    cursor.close()
+    print("🎯 既存インデックス削除完了！完全にクリーンな状態")
+
+def truncate_all_tables(conn):
+    """全テーブルのデータを削除"""
+    print("💥 既存データの完全削除...")
+    cursor = conn.cursor()
+    
+    try:
+        # 外部キー制約を一時的に無効化
+        cursor.execute("SET FOREIGN_KEY_CHECKS = 0")
+        
+        # 全テーブルを TRUNCATE
+        tables = ['access_logs', 'orders', 'products', 'customers']
+        for table in tables:
+            cursor.execute(f"TRUNCATE TABLE {table}")
+            print(f"  🗑️  {table} テーブルをクリア")
+        
+        # AUTO_INCREMENT値をリセット
+        cursor.execute("ALTER TABLE customers AUTO_INCREMENT = 1")
+        cursor.execute("ALTER TABLE products AUTO_INCREMENT = 1") 
+        cursor.execute("ALTER TABLE orders AUTO_INCREMENT = 1")
+        cursor.execute("ALTER TABLE access_logs AUTO_INCREMENT = 1")
+        
+        # 外部キー制約を再有効化
+        cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
+        conn.commit()
+        
+        print("✅ 全データ削除完了")
+        
+    except mysql.connector.Error as e:
+        print(f"💥 テーブル削除エラー: {e}")
+        cursor.execute("SET FOREIGN_KEY_CHECKS = 1")  # 念のため復元
+    
+    cursor.close()
 
 def generate_realistic_date():
     """現実的な日付分布（最近の注文が多い）"""
@@ -86,7 +145,6 @@ def generate_realistic_date():
 
 def generate_realistic_registration_date():
     """顧客登録日（古い顧客が多い傾向）"""
-    # 80%は1年以上前に登録
     if random.random() < 0.8:
         start = datetime.now() - timedelta(days=365*3)
         end = datetime.now() - timedelta(days=365)
@@ -108,7 +166,6 @@ def generate_unique_email():
 
 def generate_realistic_price():
     """現実的な価格分布"""
-    # 80%は100-1000円の商品、20%は高額商品
     if random.random() < 0.8:
         return round(random.uniform(100, 1000), 2)
     else:
@@ -152,7 +209,6 @@ def bulk_insert_realistic_customers(conn, count=50000):
             last_name = random.choice(LAST_NAMES)
             country = random.choice(COUNTRIES_WEIGHTED)
             
-            # 国に応じて都市を選択
             if country == 'Japan':
                 city = random.choice(CITIES_JAPAN)
             else:
@@ -185,7 +241,6 @@ def bulk_insert_realistic_products(conn, count=10000):
     params = []
     
     for i in range(count):
-        # 季節に応じた商品名
         season = random.choice(['winter', 'spring', 'summer', 'autumn'])
         seasonal_word = random.choice(SEASONAL_PRODUCTS[season])
         product_word = random.choice(PRODUCT_WORDS)
@@ -194,7 +249,6 @@ def bulk_insert_realistic_products(conn, count=10000):
         category = random.choice(CATEGORIES)
         price = generate_realistic_price()
         
-        # 人気商品は在庫多め、不人気商品は在庫少なめ
         if category == 'Electronics':
             stock_quantity = random.randint(50, 500)
         elif category in ['Clothing', 'Books']:
@@ -228,7 +282,7 @@ def bulk_insert_realistic_orders(conn, count=1000000):
     cursor.execute("SELECT MIN(product_id), MAX(product_id) FROM products")
     min_product_id, max_product_id = cursor.fetchone()
     
-    batch_size = 50000  # バッチサイズを調整
+    batch_size = 50000
     
     for batch_start in range(0, count, batch_size):
         batch_end = min(batch_start + batch_size, count)
@@ -240,10 +294,8 @@ def bulk_insert_realistic_orders(conn, count=1000000):
         for i in range(current_batch_size):
             # 80/20の法則：20%の顧客が80%の注文
             if random.random() < 0.2:
-                # アクティブ顧客（顧客IDの上位20%）
                 customer_id = random.randint(int(min_customer_id + (max_customer_id - min_customer_id) * 0.8), max_customer_id)
             else:
-                # 一般顧客
                 customer_id = random.randint(min_customer_id, max_customer_id)
             
             # 人気商品に偏らせる（商品IDの上位30%が70%の注文）
@@ -263,9 +315,9 @@ def bulk_insert_realistic_orders(conn, count=1000000):
             status = random.choice(STATUSES_WEIGHTED)
             
             # 配送国（顧客の国と異なる場合もある）
-            if random.random() < 0.9:  # 90%は同じ国
+            if random.random() < 0.9:
                 shipping_country = random.choice(COUNTRIES_WEIGHTED)
-            else:  # 10%は異なる国（海外配送）
+            else:
                 shipping_country = random.choice(['Japan', 'USA', 'Germany', 'UK', 'France'])
             
             # 配送都市
@@ -299,150 +351,73 @@ def bulk_insert_realistic_orders(conn, count=1000000):
     cursor.close()
     print("✅ 注文データ生成完了")
 
-def create_data_analysis_view(conn):
-    """データ分析用のビューを作成"""
+def show_final_status(conn):
+    """最終状況を表示"""
     cursor = conn.cursor()
     
-    views = [
-        """
-        CREATE OR REPLACE VIEW v_order_analysis AS
-        SELECT 
-            o.order_id,
-            o.order_date,
-            o.total_amount,
-            o.status,
-            o.shipping_country,
-            c.country as customer_country,
-            c.registration_date,
-            p.category,
-            p.price as product_price,
-            CASE 
-                WHEN o.total_amount > 2000 THEN 'High'
-                WHEN o.total_amount > 500 THEN 'Medium' 
-                ELSE 'Low'
-            END as order_value_tier,
-            CASE
-                WHEN DATEDIFF(CURDATE(), o.order_date) <= 90 THEN 'Recent'
-                WHEN DATEDIFF(CURDATE(), o.order_date) <= 365 THEN 'This Year'
-                ELSE 'Old'
-            END as order_recency
-        FROM orders o
-        JOIN customers c ON o.customer_id = c.customer_id
-        JOIN products p ON o.product_id = p.product_id
-        """,
-        """
-        CREATE OR REPLACE VIEW v_customer_summary AS
-        SELECT 
-            c.customer_id,
-            c.country,
-            c.registration_date,
-            COUNT(o.order_id) as total_orders,
-            SUM(o.total_amount) as total_spent,
-            AVG(o.total_amount) as avg_order_value,
-            MAX(o.order_date) as last_order_date,
-            CASE 
-                WHEN SUM(o.total_amount) > 10000 THEN 'VIP'
-                WHEN SUM(o.total_amount) > 5000 THEN 'Premium'
-                WHEN SUM(o.total_amount) > 1000 THEN 'Regular'
-                ELSE 'New'
-            END as customer_tier
-        FROM customers c
-        LEFT JOIN orders o ON c.customer_id = o.customer_id
-        GROUP BY c.customer_id, c.country, c.registration_date
-        """
-    ]
+    print("\n" + "🎯" * 30)
+    print("📊 最終データ状況レポート")
+    print("🎯" * 30)
     
-    for view_sql in views:
-        try:
-            cursor.execute(view_sql)
-            conn.commit()
-        except Exception as e:
-            print(f"ビュー作成エラー: {e}")
+    # テーブル件数
+    cursor.execute("SELECT 'customers' as table_name, COUNT(*) as count FROM customers UNION ALL SELECT 'products', COUNT(*) FROM products UNION ALL SELECT 'orders', COUNT(*) FROM orders")
     
-    cursor.close()
-    print("📊 分析用ビューを作成完了")
-
-def show_data_distribution(conn):
-    """データ分布を表示"""
-    cursor = conn.cursor()
-    
-    print("\n📈 データ分布レポート")
-    print("=" * 50)
-    
-    # 国別分布
-    cursor.execute("""
-        SELECT shipping_country, COUNT(*) as orders, 
-               ROUND(COUNT(*) * 100.0 / (SELECT COUNT(*) FROM orders), 1) as percentage
-        FROM orders 
-        GROUP BY shipping_country 
-        ORDER BY orders DESC
-    """)
-    
-    print("\n🌍 国別注文分布:")
+    print("\n📈 テーブル別レコード数:")
     for row in cursor.fetchall():
-        print(f"  {row[0]:15} {row[1]:8,}件 ({row[2]:5.1f}%)")
+        print(f"  📋 {row[0]:12} {row[1]:8,}件")
     
-    # ステータス別分布
-    cursor.execute("""
-        SELECT status, COUNT(*) as orders,
-               ROUND(COUNT(*) * 100.0 / (SELECT COUNT(*) FROM orders), 1) as percentage
-        FROM orders 
-        GROUP BY status 
-        ORDER BY orders DESC
-    """)
+    # インデックス確認
+    print(f"\n🔍 現在のインデックス状況:")
+    tables = ['customers', 'products', 'orders']
     
-    print("\n📦 ステータス別分布:")
-    for row in cursor.fetchall():
-        print(f"  {row[0]:15} {row[1]:8,}件 ({row[2]:5.1f}%)")
-    
-    # 月別注文数
-    cursor.execute("""
-        SELECT DATE_FORMAT(order_date, '%Y-%m') as month, COUNT(*) as orders
-        FROM orders 
-        WHERE order_date >= DATE_SUB(CURDATE(), INTERVAL 12 MONTH)
-        GROUP BY DATE_FORMAT(order_date, '%Y-%m')
-        ORDER BY month DESC
-        LIMIT 6
-    """)
-    
-    print("\n📅 直近6ヶ月の注文推移:")
-    for row in cursor.fetchall():
-        print(f"  {row[0]} {row[1]:8,}件")
+    for table in tables:
+        cursor.execute(f"SHOW INDEX FROM {table}")
+        indexes = cursor.fetchall()
+        
+        # PRIMARY KEY以外のインデックスをカウント
+        custom_indexes = [idx[2] for idx in indexes if idx[2] != 'PRIMARY']
+        
+        if custom_indexes:
+            print(f"  ⚠️  {table}: {', '.join(custom_indexes)} が残存")
+        else:
+            print(f"  ✅ {table}: インデックスなし（PRIMARY KEYのみ）")
     
     cursor.close()
 
 def main():
     """メイン処理"""
-    print("🚀 現実的なサンプルデータ生成開始")
-    print("💪 インデックス効果を最大化するデータ分布で攻める！")
+    print("🚀 完全クリーンスタート版データ生成開始")
+    print("💥 既存インデックス全削除 → 現実的データ生成")
     print("=" * 60)
     
     conn = connect_db()
     
     try:
-        # MySQL設定を最適化
+        # ステップ1: 既存インデックスを完全削除
+        drop_all_existing_indexes(conn)
+        
+        # ステップ2: 既存データを完全削除
+        truncate_all_tables(conn)
+        
+        # ステップ3: MySQL設定を最適化
         optimize_mysql_for_bulk_insert(conn)
         
-        # 現実的なデータ生成
+        # ステップ4: 現実的なデータ生成
         bulk_insert_realistic_customers(conn, 50000)
         bulk_insert_realistic_products(conn, 10000)
         bulk_insert_realistic_orders(conn, 1000000)
         
-        # 分析用ビュー作成
-        create_data_analysis_view(conn)
-        
-        # MySQL設定を元に戻す
+        # ステップ5: MySQL設定を元に戻す
         restore_mysql_settings(conn)
         
-        # データ分布レポート
-        show_data_distribution(conn)
+        # ステップ6: 最終状況レポート
+        show_final_status(conn)
         
         print("\n" + "🎉" * 20)
-        print("💯 現実的なサンプルデータ生成完了！")
-        print("👥 顧客: 50,000件 (日本70%、偏った分布)")
-        print("📦 商品: 10,000件 (Electronics多め、季節性あり)")
-        print("🛒 注文: 1,000,000件 (80/20法則、現実的偏り)")
-        print("📊 総計: 1,060,000件の戦略的データ")
+        print("💯 完全クリーンスタート版データ生成完了！")
+        print("🧹 既存インデックス: 完全削除済み")
+        print("📊 現実的データ: 106万件生成済み")
+        print("⚡ ベンチマーク準備: 完璧な状態")
         
     except Exception as e:
         print(f"💥 エラーが発生しました: {e}")
