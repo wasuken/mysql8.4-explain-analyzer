@@ -29,7 +29,7 @@ services:
   # MySQL管理用のphpMyAdmin（オプション）
   phpmyadmin:
     image: phpmyadmin/phpmyadmin:latest
-    container_name: phpmyadmin
+    container_name: ea_phpmyadmin
     environment:
       PMA_HOST: mysql
       PMA_USER: testuser
