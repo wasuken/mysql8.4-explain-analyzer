@@ -49,17 +49,6 @@ QUERIES = {
         LIMIT 8000
         """,
     },
-    "double_range_nightmare": {
-        "name": "🔥 ダブル範囲検索地獄",
-        "sql": """
-        SELECT order_id, order_date, total_amount, shipping_country
-        FROM orders
-        WHERE order_date BETWEEN DATE_SUB(CURDATE(), INTERVAL 6 MONTH) AND CURDATE()
-          AND total_amount BETWEEN 200 AND 800
-        ORDER BY total_amount DESC, order_date DESC
-        LIMIT 3000
-        """,
-    },
     "double_range_nightmare_safe": {
         "name": "🔥 ダブル範囲検索地獄解消",
         "sql": """

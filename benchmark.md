@@ -12,6 +12,18 @@ MySQL学習、特にパフォーマンスチューニング学習の一環でExp
 
 ハンズオンで慣れようといった趣旨の記事だ。
 
+## 注意
+
+今回割と初の試みで四苦八苦したが
+
+結論から言えばこれらの計測はかなりおかしな内容である可能性が高い。
+
+なぜならインデックスが効かないと記載した箇所について後日再計測した際に、計測値がズレたからだ。
+
+色々と調べて、キャッシュなどリセットしたりしてみたが、変わらなかった。
+
+二週間ほど経過し、熱量がほぼなくなってきたので一旦落ち着ける形としてこの記事を投稿して終わりにしようと思った次第だ。
+
 ## 検証環境
 
 Docker + MySQL 8.4.3で以下の構成を構築：
@@ -267,6 +279,7 @@ explainしてみた。
 - そもそもwhere条件でほとんど絞れてない
 - DATE_FORMAT関数を挟んでいるので全行処理が必要となり、集計計算が必要になることが原因の一つ。
 - 集計後のデータをソートすることになるため、インデックスが利用できない
+- GROUP BYの一時テーブル作成コストが支配的である可能性が高い。
 
 上記により、そもそも構造が悪いと言える。
 
@@ -374,9 +387,9 @@ LIMIT 3000
 ##### 改善
 
 ```sql
-SELECT /*+ USE INDEX (orders, idx_date_amount) */
+SELECT
   order_id, order_date, total_amount, shipping_country
-FROM orders
+FROM orders USE INDEX (idx_date_amount)
 WHERE order_date BETWEEN DATE_SUB(CURDATE(), INTERVAL 6 MONTH) AND CURDATE()
   AND total_amount BETWEEN 200 AND 800
 ORDER BY order_date DESC, total_amount DESC
@@ -388,19 +401,8 @@ USE INDEXを追加したところ、改善した。
 [MySQL :: MySQL 8.0 リファレンスマニュアル :: 8.9.4 インデックスヒント](https://dev.mysql.com/doc/refman/8.0/ja/index-hints.html)
 
 ```
-🔍 EXPLAIN詳細 (インデックスなし):
 
-   -> Limit: 3000 row(s)  (cost=90822 rows=3000) (actual time=3984..3997 rows=3000 loops=1)
-
-       -> Sort: orders.order_date DESC, orders.total_amount DESC, limit input to 3000 row(s) per chunk  (cost=90822 rows=995561) (actual time=3984..3988 rows=3000 loops=1)
-
-```
-
-```
-
-🔍 EXPLAIN詳細 (インデックスあり):
-
-   -> Limit: 3000 row(s)  (cost=112656 rows=3000) (actual time=10.9..58.9 rows=3000 loops=1)
+-> Limit: 3000 row(s)  (cost=112656 rows=3000) (actual time=10.9..58.9 rows=3000 loops=1)
 
        -> Filter: ((orders.order_date between <cache>((curdate() - interval 6 month)) and <cache>(curdate())) and (orders.total_amount between 200 and 800))  (cost=112656 rows=248890) (actual time=10.8..46.8 rows=3000 loops=1)
 
@@ -487,3 +489,21 @@ CREATE INDEX idx_covering_range ON orders(order_date, total_amount, shipping_cou
 - 簡単な使い方
 - 簡単な見方
 - 簡単な調査方法
+
+# 技術とあんまり関係ない感想
+
+生成AIのやつそのままやれば二週間前には投稿できていた内容だけど、
+
+なんだかなと思って手を加えたのが終わり
+
+そのままズルズルと修正に修正を重ねて気がつけば時が経過していた。
+
+生成AIがなかったらもっとかかってた。なんならだるくて書けなかった内容ではあるが、
+
+次からはクエリ絞って記事を分割しようと思った。
+
+熱量がなくなったというと私から見るとやる気がないだけだと感じる。
+
+実際底に隠れているそこそこ複雑な損得勘定が動いた上での損切りということはしっかりと把握したい。
+
+とはいえ、旗から見たらうんこみたいな記事書いただけなのが、非常に悔しい。
